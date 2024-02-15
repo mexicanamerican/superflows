@@ -8,6 +8,7 @@ import {
   parseErrorHtml,
   replaceVariables,
 } from "../../../lib/edge-runtime/utils";
+import { dataAnalysisActionName } from "../../../lib/builtinActions";
 
 describe("MessageInclSummaryToGPT", () => {
   it("user", () => {
@@ -294,7 +295,7 @@ describe("parseErrorHtml", () => {
     const res = parseErrorHtml(errorHtml);
     expect(res).toEqual(`404: This page could not be found
 404
-This page could not be found.`);
+This page could not be found<!-- -->.`);
   });
   it("multiple h1 and h2", () => {
     const errorHtml = `<!DOCTYPE html><html>
@@ -392,13 +393,13 @@ describe("hideMostRecentFunctionOutputs", () => {
         role: "function",
         name: "function",
         content: "This is a test",
-        summary: "Output used by analytics mode",
+        summary: `Data output used by ${dataAnalysisActionName}`,
       },
       {
         role: "function",
         name: "function",
         content: "This is a test",
-        summary: "Output used by analytics mode",
+        summary: `Data output used by ${dataAnalysisActionName}`,
       },
     ]);
   });
@@ -418,13 +419,13 @@ describe("hideMostRecentFunctionOutputs", () => {
         role: "function",
         name: "function",
         content: "This is a test",
-        summary: "Output used by analytics mode",
+        summary: `Data output used by ${dataAnalysisActionName}`,
       },
       {
         role: "function",
         name: "function",
         content: "This is a test",
-        summary: "Output used by analytics mode",
+        summary: `Data output used by ${dataAnalysisActionName}`,
       },
     ]);
   });

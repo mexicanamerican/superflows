@@ -7,49 +7,55 @@ import {
   FunctionMessageInclSummary,
   GPTMessageInclSummary,
   ToConfirm,
-} from "../models";
-import { ActionPlusApiInfo, OrgJoinIsPaidFinetunedModels } from "../types";
-import getMessages, { chatToDocsPrompt } from "../prompts/chatBot";
+} from "../../models";
+import { ActionPlusApiInfo, OrgJoinIsPaidFinetunedModels } from "../../types";
+import getMessages from "../prompts/chatBot";
 import {
   repopulateVariables,
   sanitizeMessages,
-} from "./apiResponseSimplification";
+} from "../../edge-runtime/apiResponseSimplification";
 import {
   hideMostRecentFunctionOutputs,
   MessageInclSummaryToGPT,
   preStreamProcessOutMessage,
   removeOldestFunctionCalls,
   sortObjectToArray,
-} from "./utils";
-import { exponentialRetryWrapper, getTokenCount, openAiCost } from "../utils";
-import { getLLMResponse, streamLLMResponse } from "../queryLLM";
-import { MAX_TOKENS_OUT } from "../consts";
+} from "../../edge-runtime/utils";
+import {
+  exponentialRetryWrapper,
+  getTokenCount,
+  openAiCost,
+} from "../../utils";
+import { streamLLMResponse } from "../../queryLLM";
+import { MAX_TOKENS_OUT } from "../../consts";
 import { FunctionCall, parseOutput } from "@superflows/chat-ui-react";
 import { filterActions } from "./filterActions";
 import {
   streamResponseToUser,
   updatePastAssistantMessage,
-} from "./angelaUtils";
-import { getMissingArgCorrections } from "./missingParamCorrection";
-import { requestCorrectionSystemPrompt } from "../prompts/requestCorrection";
+} from "../../edge-runtime/angelaUtils";
+import { getMissingArgCorrections } from "../../edge-runtime/missingParamCorrection";
+import { requestCorrectionSystemPrompt } from "../../prompts/requestCorrection";
 import {
   constructHttpRequest,
   makeHttpRequest,
   processAPIoutput,
-} from "./requests";
-import summarizeText from "./summarize";
+} from "../../edge-runtime/requests";
+import summarizeText from "../../edge-runtime/summarize";
 import { createClient } from "@supabase/supabase-js";
-import { Database } from "../database.types";
-import { getRelevantDocChunks } from "../embed-docs/docsSearch";
-import { hallucinateDocsSystemPrompt } from "../prompts/hallucinateDocs";
-import { runDataAnalysis } from "./dataAnalysis";
+import { Database } from "../../database.types";
+import { convertToGraphData, runDataAnalysis } from "./dataAnalysis";
 import {
   dataAnalysisActionName,
   dataAnalysisAction,
   getSearchDocsAction,
-} from "../builtinActions";
-import { StreamingStepInput } from "@superflows/chat-ui-react/dist/src/lib/types";
-import { LlmResponseCache } from "./llmResponseCache";
+} from "../../builtinActions";
+import {
+  GraphData,
+  StreamingStepInput,
+} from "@superflows/chat-ui-react/dist/src/lib/types";
+import { LlmResponseCache } from "../../edge-runtime/llmResponseCache";
+import { storeActionsAwaitingConfirmation } from "../../edge-runtime/ai";
 
 let redis: Redis | null = null;
 if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
@@ -60,171 +66,43 @@ const supabase = createClient<Database>(
   process.env.SERVICE_LEVEL_KEY_SUPABASE!,
 );
 
-export async function Dottie( // Dottie talks to docs
-  controller: ReadableStreamDefaultController,
-  reqData: AnswersType,
-  org: OrgJoinIsPaidFinetunedModels,
-  conversationId: number,
-  previousMessages: ChatGPTMessage[],
-  language: string | null,
-): Promise<{
-  nonSystemMessages: ChatGPTMessage[];
-  cost: number;
-  numUserQueries: number;
-}> {
-  console.log("Dottie called!");
-  const streamInfo = await preamble(
-    controller,
-    conversationId,
-    [],
-    reqData,
-    org,
-    language,
-  );
-
-  const model = org.model;
-  const nonSystemMessages = [...previousMessages];
-  const maxConvLength = model === "gpt-4-0613" ? 20 : 10;
-  let cost = 0;
-
-  // Const controlling how much context to include
-  const nChunksInclude = 3;
-
-  try {
-    // To stop going over the context limit: only remember the last 'maxConvLength' messages
-    let recentMessages = [
-      ...nonSystemMessages.slice(
-        Math.max(0, nonSystemMessages.length - maxConvLength),
-      ),
-    ];
-
-    // If function response too old, remove oldest documentation chunks
-    recentMessages = removeOldestFunctionCalls(
-      recentMessages,
-      undefined,
-      1000, // Cut out old docs retrieved, but keep old questions & answers
-    );
-
-    const hallucinatedDocsPrompt = [
-      hallucinateDocsSystemPrompt(reqData.user_description, org),
-      ...recentMessages.filter((m) => m.role !== "function"),
-    ];
-
-    const hallucinatedRes = await exponentialRetryWrapper(
-      getLLMResponse,
-      [hallucinatedDocsPrompt, { ...completionOptions, temperature: 1 }, model],
-      3,
-    );
-    console.log("Hallucination: ", hallucinatedRes);
-
-    // We do embedding and similarity search on the hallucinated docs
-    const relevantDocs = await getRelevantDocChunks(
-      hallucinatedRes,
-      org.id,
-      nChunksInclude,
-      supabase,
-    );
-
-    let docMessage = {
-      role: "function",
-      content: relevantDocs.text,
-      name: "search_docs",
-    } as Extract<GPTMessageInclSummary, { role: "function" }>;
-
-    recentMessages.push(docMessage);
-    nonSystemMessages.push(docMessage);
-    // Copy to not mutate the original
-    docMessage = { ...docMessage };
-    // Add doc links
-    docMessage.urls = relevantDocs.urls;
-    console.log("Doc links added:", docMessage.urls);
-    streamInfo(docMessage);
-
-    const { cleanedMessages, originalToPlaceholderMap } = sanitizeMessages(
-      recentMessages,
-      true,
-    );
-    console.log("Original to placeholder map", originalToPlaceholderMap);
-
-    let chatGptPrompt: ChatGPTMessage[] = [
-      chatToDocsPrompt(
-        reqData.user_description,
-        org,
-        Object.entries(originalToPlaceholderMap).length > 0,
-        language,
-      ),
-      ...cleanedMessages,
-    ];
-
-    const promptInputCost = openAiCost(chatGptPrompt, "in", model);
-    console.log("GPT input cost:", promptInputCost);
-    cost += promptInputCost;
-
-    console.log(
-      "Dottie prompt:\n",
-      JSON.stringify(chatGptPrompt, undefined, 2),
-      "\n\n",
-    );
-    const res = await exponentialRetryWrapper(
-      streamLLMResponse,
-      [chatGptPrompt, { ...completionOptions, temperature: 0.4 }, model],
-      3,
-    );
-    if (res === null || (typeof res !== "string" && "message" in res)) {
-      console.error(
-        `OpenAI API call failed for conversation with id: ${conversationId}. The error was: ${JSON.stringify(
-          res,
-        )}`,
-      );
-      streamInfo({
-        role: "error",
-        content: "Call to Language Model API failed",
-      });
-      return { nonSystemMessages, cost, numUserQueries: 0 };
-    }
-
-    let rawOutput: string;
-    if (typeof res === "string") {
-      // If non-streaming response, just return the full output
-      rawOutput = res;
-      streamInfo({ role: "assistant", content: res });
-    } else {
-      // Stream response chunk by chunk
-      rawOutput = await streamResponseToUser(
-        res,
-        streamInfo,
-        originalToPlaceholderMap,
-      );
-    }
-
-    const newMessage = {
-      role: "assistant",
-      content: rawOutput,
-    } as ChatGPTMessage;
-
-    const outCost = openAiCost([newMessage], "out", model);
-    cost += outCost;
-
-    // Add assistant message to nonSystemMessages
-    nonSystemMessages.push(newMessage);
-    return { nonSystemMessages, cost, numUserQueries: 1 };
-  } catch (e) {
-    console.error(e?.toString() ?? "Internal server error");
-    streamInfo({
-      role: "error",
-      content: e?.toString() ?? "Internal server error",
-    });
-    return { nonSystemMessages, cost, numUserQueries: 1 };
-  }
-}
-
 const completionOptions: ChatGPTParams = {
   max_tokens: MAX_TOKENS_OUT,
   temperature: 0.2,
 };
 
-// Angela takes actions
-export async function Angela( // Good ol' Angela
+const FASTMODEL = "ft:gpt-3.5-turbo-0613:superflows:general-2:81WtjDqY";
+
+function hideLongGraphOutputs(chatGptPrompt: ChatGPTMessage[]): {
+  chatGptPrompt: ChatGPTMessage[];
+  graphDataHidden: boolean;
+} {
+  let graphDataHidden = false;
+  const out = chatGptPrompt.map((m) => {
+    if (m.role === "function" && m.name === dataAnalysisActionName) {
+      if (
+        // No newlines in our minified JSONs
+        !m.content.includes("\n") &&
+        // Below are to check it's a JSON
+        ["{", "["].includes(m.content[0]) &&
+        ["}", "]"].includes(m.content[m.content.length - 1]) &&
+        // Got to be long otherwise no point
+        getTokenCount([m]) > 500
+      ) {
+        const graphData = JSON.parse(m.content) as GraphData;
+        // @ts-ignore
+        graphData.data =
+          "<cut for brevity - DO NOT pretend to know the data, instead tell the user to look at this graph>";
+        graphDataHidden = true;
+        m.content = JSON.stringify(graphData);
+      }
+    }
+    return m;
+  });
+  return { chatGptPrompt: out, graphDataHidden };
+}
+
+export async function Bertie( // Bertie will eat you for breakfast
   controller: ReadableStreamDefaultController,
   reqData: AnswersType,
   actions: ActionPlusApiInfo[],
@@ -238,20 +116,13 @@ export async function Angela( // Good ol' Angela
   cost: number;
   numUserQueries: number;
 }> {
-  // When this number is reached, we remove the oldest messages from the context window
-  const streamInfo = await preamble(
-    controller,
-    conversationId,
-    actions,
-    reqData,
-    org,
-    language,
-  );
+  console.log("Bertie will eat you for breakfast");
+  const streamInfo = await preamble(controller, conversationId);
 
   let nonSystemMessages = [...previousMessages];
   const model = org.model;
   // GPT4 can deal with longer context window better
-  const maxConvLength = model === "gpt-4-0613" ? 20 : 14;
+  const maxConvLength = model === "gpt-4" ? 20 : 14;
   let mostRecentParsedOutput = {
     reasoning: "",
     plan: "",
@@ -272,23 +143,24 @@ export async function Angela( // Good ol' Angela
     nonSystemMessages.length - 1,
     supabase,
   );
-
   // This allows us to add the 'Search docs' action if it's enabled
   if (org.chat_to_docs_enabled) {
     actions.unshift(getSearchDocsAction(org, currentHost));
   }
+
+  let thoughts = "";
+  if (actions.length > 2) {
+    ({ thoughts, actions } = await filterActions(
+      actions,
+      nonSystemMessages,
+      org!.name,
+      FASTMODEL,
+    ));
+  }
+
   // Add analytics action if enabled
   actions.unshift(dataAnalysisAction(org));
-
-  if (actions.length > 5 && model.includes("3.5")) {
-    actions = await filterActions(
-      actions,
-      nonSystemMessages.slice(
-        Math.max(0, nonSystemMessages.length - maxConvLength),
-      ),
-      model,
-    );
-  }
+  let graphDataHidden = false;
 
   try {
     while (!mostRecentParsedOutput.completed && !awaitingConfirmation) {
@@ -296,6 +168,12 @@ export async function Angela( // Good ol' Angela
       if (numOpenAIRequests > 0) {
         streamInfo({ role: "loading", content: "Thinking" });
       }
+      console.log(
+        "\n\nNum of non system messages:",
+        nonSystemMessages.length,
+        "with types:",
+        nonSystemMessages.map((m) => m.role),
+      );
 
       // To stop going over the context limit: only remember the last 'maxConvLength' messages
       const recentMessages = nonSystemMessages
@@ -305,10 +183,14 @@ export async function Angela( // Good ol' Angela
 
       // Replace messages with `cleanedMessages` which has removed long IDs & URLs.
       // originalToPlaceholderMap is a map from the original string to the placeholder (URLX/IDX)
-      const { cleanedMessages, originalToPlaceholderMap } = sanitizeMessages(
+      let { cleanedMessages, originalToPlaceholderMap } = sanitizeMessages(
         recentMessages,
         org.sanitize_urls_first,
       );
+      // Hide very long graph outputs
+      ({ chatGptPrompt: cleanedMessages, graphDataHidden } =
+        hideLongGraphOutputs(cleanedMessages));
+
       let chatGptPrompt: ChatGPTMessage[] = getMessages(
         cleanedMessages,
         actions,
@@ -316,19 +198,21 @@ export async function Angela( // Good ol' Angela
         org,
         language,
         Object.entries(originalToPlaceholderMap).length > 0,
+        graphDataHidden,
       );
-      if (process.env.NODE_ENV === "development") {
-        console.log(
-          "Angela system prompt:\n",
-          chatGptPrompt[0].content,
-          "\n\n",
-        );
-      }
 
       // If over context limit, remove oldest function calls
       chatGptPrompt = removeOldestFunctionCalls(
         [...chatGptPrompt],
         model === "gpt-4-0613" ? "4" : "3",
+      );
+
+      console.log(
+        "Bertie prompt:\n",
+        chatGptPrompt
+          .map((m) => `${m.role} message:\n${m.content}`)
+          .join("\n\n"),
+        "\n\n",
       );
 
       let rawOutput = chatMessageCache.checkChatCache(nonSystemMessages);
@@ -361,12 +245,17 @@ export async function Angela( // Good ol' Angela
 
         const res = await exponentialRetryWrapper(
           streamLLMResponse,
-          [chatGptPrompt, completionOptions, model],
+          // No actions means it's explaining a graph output to the user
+          [
+            chatGptPrompt,
+            completionOptions,
+            actions.length > 0 ? model : FASTMODEL,
+          ],
           3,
         );
         if (res === null || (typeof res !== "string" && "message" in res)) {
           console.error(
-            `OpenAI API call failed for conversation with id: ${conversationId}. The error was: ${JSON.stringify(
+            `Language Model API call failed for conversation with id: ${conversationId}. The error was: ${JSON.stringify(
               res,
             )}`,
           );
@@ -605,52 +494,55 @@ export async function Angela( // Good ol' Angela
       const dataAnalysisAction = mostRecentParsedOutput.commands.find(
         (c) => c.name === dataAnalysisActionName,
       );
-      console.log("Data analysis action:", dataAnalysisAction);
-      const pastFunctionCalls = nonSystemMessages.filter(
-        (m) => m.role === "function",
-      );
       // Used in if statements further down
       const fnMsg: FunctionMessage = {
         role: "function",
         name: dataAnalysisActionName,
         content: "",
       };
-      if (
-        dataAnalysisAction &&
-        !anyNeedCorrection &&
-        toConfirm.length === 0 &&
-        !errorMakingAPICall &&
-        // Must have been a function call previously
-        pastFunctionCalls.length > 0
-      ) {
+      if (dataAnalysisAction && !anyNeedCorrection && toConfirm.length === 0) {
         console.log("Running data analysis!");
-        streamInfo({ role: "loading", content: "Analysing data" });
+        streamInfo({ role: "loading", content: "Performing complex action" });
+        actions = actions.slice(1);
         const graphData = await runDataAnalysis(
           dataAnalysisAction.args["instruction"],
           actions,
-          nonSystemMessages,
+          // nonSystemMessages,
           org,
           { conversationId, index: nonSystemMessages.length },
+          reqData.user_description ?? "",
           chatMessageCache,
+          thoughts,
+          conversationId,
+          streamInfo,
         );
-        nonSystemMessages = hideMostRecentFunctionOutputs(nonSystemMessages);
+        // Make last message an explanation-only message
+        actions = [];
 
         // Return graph data to the user & add message to chat history
         if (graphData === null) {
           fnMsg.content = "Failed to run data analysis";
           streamInfo(fnMsg);
+          nonSystemMessages.push(fnMsg);
         } else if ("error" in graphData) {
           // Handle error - add function message
           fnMsg.content = graphData.error;
           streamInfo(fnMsg);
+          nonSystemMessages.push(fnMsg);
         } else {
-          streamInfo({
-            role: "graph",
-            content: graphData,
-          });
-          fnMsg.content = JSON.stringify(graphData);
+          const graphDataArr = convertToGraphData(graphData);
+          graphDataArr.map(streamInfo);
+          nonSystemMessages = nonSystemMessages.concat(
+            graphDataArr.map((m) => ({
+              role: "function",
+              name: dataAnalysisActionName,
+              content:
+                typeof m.content === "string"
+                  ? m.content
+                  : JSON.stringify(m.content),
+            })),
+          );
         }
-        nonSystemMessages.push(fnMsg);
         // No need to stream data analysis errors to the user
       } else if (dataAnalysisAction) {
         if (anyNeedCorrection) {
@@ -659,12 +551,6 @@ export async function Angela( // Good ol' Angela
         } else if (toConfirm.length !== 0) {
           fnMsg.content =
             "Error: another function call requires user confirmation";
-          nonSystemMessages.push(fnMsg);
-        } else if (pastFunctionCalls.length === 0) {
-          fnMsg.content = `Error: no functions have been called in the chat history yet`;
-          nonSystemMessages.push(fnMsg);
-        } else if (errorMakingAPICall) {
-          fnMsg.content = `Error: an API call failed, so data analysis skipped`;
           nonSystemMessages.push(fnMsg);
         }
       }
@@ -700,14 +586,10 @@ export async function Angela( // Good ol' Angela
 async function preamble(
   controller: ReadableStreamDefaultController,
   conversationId: number,
-  actions: ActionPlusApiInfo[],
-  reqData: AnswersType,
-  org: OrgJoinIsPaidFinetunedModels,
-  language: string | null,
 ) {
   const encoder = new TextEncoder();
 
-  function streamInfo(step: StreamingStepInput) {
+  return function streamInfo(step: StreamingStepInput) {
     controller.enqueue(
       encoder.encode(
         "data: " +
@@ -717,44 +599,5 @@ async function preamble(
           }),
       ),
     );
-  }
-
-  if (redis) {
-    // Store the system prompt, in case we get feedback on it
-    const redisKey = conversationId.toString() + "-system-prompt";
-    const systemPrompt =
-      actions.length > 0
-        ? getMessages(
-            [],
-            actions,
-            reqData.user_description,
-            org,
-            language,
-            // TODO: ID line isn't always included, but we don't know whether it should be at this point (no functions called yet)
-            false,
-          )[0].content
-        : chatToDocsPrompt(reqData.user_description, org, false, language)
-            .content;
-    await redis.set(redisKey, systemPrompt);
-    await redis.expire(redisKey, 60 * 15);
-  }
-  return streamInfo;
-}
-
-export async function storeActionsAwaitingConfirmation(
-  toConfirm: ToConfirm[],
-  conversationId: number,
-) {
-  const redisKey = conversationId.toString() + "-toConfirm";
-  if (toConfirm.length > 0 && redis) {
-    if ((await redis.get(redisKey)) !== null)
-      throw new Error(
-        `Conversation ID "${conversationId}" already exists in redis, something has gone wrong`,
-      );
-    console.log("Setting redis key: ", redisKey);
-
-    await redis.json.set(redisKey, "$", { toConfirm });
-    // 10 minutes seems like a reasonable time if the user gets distracted etc
-    await redis.expire(redisKey, 60 * 10);
-  }
+  };
 }
