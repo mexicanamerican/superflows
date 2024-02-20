@@ -20,11 +20,7 @@ export function processAPIoutput(
 ): Json | Json[] {
   const keys = chosenAction.keys_to_keep;
   if (keys && Array.isArray(keys) && keys.every((k) => typeof k === "string")) {
-    if (Array.isArray(out)) {
-      console.warn("De-duplicating array");
-      out = deduplicateArray(out) as Json[];
-    }
-    console.warn("Filtering to keep keys:", keys);
+    console.info("Filtering to keep keys:", keys);
     out = filterKeys(out, keys as string[]);
   }
 
@@ -70,8 +66,8 @@ export function constructHttpRequest({
     throw new Error("API host has not been provided");
   }
 
-  console.warn("Constructing http request for action:" + action.name);
-  console.warn("parameters:" + JSON.stringify(parameters));
+  console.info("Constructing http request for action:" + action.name);
+  console.info("parameters:" + JSON.stringify(parameters));
 
   const headers: Record<string, string> = {};
   // TODO: You can only overwrite this header if it's in the parameters
@@ -117,7 +113,7 @@ export function constructHttpRequest({
     const actionParameters = action.parameters as unknown as ParameterObject[];
 
     for (const param of actionParameters) {
-      console.warn(`processing param: ${JSON.stringify(param)}`);
+      console.info(`processing param: ${JSON.stringify(param)}`);
       // Check for case of required parameter that has enum with 1 value
       const schema = param.schema as SchemaObject;
       if (param.required && schema.enum && schema.enum.length === 1) {
@@ -126,7 +122,7 @@ export function constructHttpRequest({
       }
 
       if (!parameters[param.name]) {
-        console.warn("Parameter not provided:" + param.name);
+        console.info("Parameter not provided:" + param.name);
         continue;
       }
 
@@ -164,6 +160,7 @@ export function constructHttpRequest({
 
   requestOptions.headers = headers;
   let logMessage = forgeLogMessage(url, requestOptions);
+  console.info("action.api", action.api);
   if (userApiKey && action.api.auth_header !== "Query parameter") {
     const includeScheme = [
       "Authorization",
@@ -181,7 +178,7 @@ export function constructHttpRequest({
     // Add it in before it's output
     requestOptions.headers[action.api.auth_header] = `${scheme}${userApiKey}`;
   }
-  console.warn(logMessage);
+  console.info(logMessage);
 
   return { url, requestOptions };
 }
@@ -206,7 +203,7 @@ export function bodyPropertiesFromRequestBodyContents(
     [media: string]: MediaTypeObject;
   };
 
-  console.warn("reqBodyContents:" + JSON.stringify(reqBodyContents, null, 2));
+  console.info("reqBodyContents:" + JSON.stringify(reqBodyContents, null, 2));
 
   // TODO: Only application/json supported for now
   const applicationJson = getJsonMIMEType(reqBodyContents);
@@ -226,7 +223,7 @@ function buildBody(
   const properties = schema.properties as {
     [name: string]: SchemaObject;
   };
-  console.warn("properties:" + JSON.stringify(properties));
+  console.info("properties:" + JSON.stringify(properties));
 
   const bodyArray = Object.entries(properties).map(([name, property]) => {
     // Throw out readonly attributes
@@ -255,7 +252,7 @@ export async function makeHttpRequest(
   );
   if (response.status >= 300 && response.status < 400) {
     // Try requesting from here without auth headers
-    console.warn("Attempting manual redirect");
+    console.info("Attempting manual redirect");
 
     if (!response.headers.has("location")) {
       return {
@@ -281,14 +278,14 @@ export async function makeHttpRequest(
       ? response.headers.get("location")!
       : new URL(response.headers.get("location")!, origin).href;
 
-    console.warn("Attempting fetch with redirected url: " + redirectUrl);
+    console.info("Attempting fetch with redirected url: " + redirectUrl);
     requestOptionsCopy.headers = headers;
     response = await fetch(redirectUrl, { ...requestOptionsCopy });
   }
 
   // Deal with response with potentially empty body (stackoverflow.com/a/51320025)
   const responseStatus = response.status ?? 0;
-  console.warn("Response status:" + responseStatus);
+  console.info("Response status:" + responseStatus);
   const responseText = await response.text();
   // If there's no response body, return a status message
   if (!responseText) {
@@ -320,7 +317,7 @@ export async function makeHttpRequest(
     requestOptions?.headers ?? null;
 
   if (!reqHeaders) {
-    console.warn("No request headers - returning response text");
+    console.info("No request headers - returning response text");
     return { output: responseText, isError: false };
   }
 
@@ -342,12 +339,12 @@ export async function makeHttpRequest(
     }
   } else if (responseType === "application/pdf") {
     if (!process.env.PDF_TO_TEXT_URL) {
-      console.warn(
+      console.info(
         "PDF to text service is not configured - set PDF_TO_TEXT_URL environment variable to enable",
       );
       return { output: "PDF to text service is not configured", isError: true };
     }
-    console.warn("Response type is pdf - calling /parse-pdf");
+    console.info("Response type is pdf - calling /parse-pdf");
     // This gets the pdf and then parses it into text. We aren't
     // calling this function here because it requires nodejs runtime
     const res = await fetch(`${process.env.PDF_TO_TEXT_URL}/parse-pdf`, {
@@ -380,23 +377,4 @@ export async function makeHttpRequest(
     return { output: await res.text(), isError: false };
   }
   return { output: responseText, isError: false };
-}
-
-export function getDocsChatRequest(
-  chosenAction: ActionPlusApiInfo,
-  user_input: string,
-): { url: string; requestOptions: RequestInit } {
-  return {
-    url: endpointUrlFromAction({
-      api_host: chosenAction.api.api_host,
-      path: chosenAction.path!,
-    }),
-    requestOptions: {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        query: user_input,
-      }),
-    },
-  };
 }

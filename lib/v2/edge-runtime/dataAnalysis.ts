@@ -92,6 +92,7 @@ export async function runDataAnalysis(
   thoughts: string,
   conversationId: number,
   streamInfo: (step: StreamingStepInput) => void,
+  userApiKey?: string,
 ): Promise<ExecuteCode2Item[] | { error: string } | null> {
   const dataAnalysisPrompt = getDataAnalysisPrompt({
     question: instruction,
@@ -117,6 +118,7 @@ export async function runDataAnalysis(
       ...defaultDataAnalysisParams,
       temperature: nLoops === 0 ? 0.1 : 0.8,
     };
+    nLoops += 1;
     // const graphDatas = (
     // await Promise.all(
     //   [1, 2, 3].map(async (i) => {
@@ -134,8 +136,13 @@ export async function runDataAnalysis(
     }
 
     // Parse the result
-    let parsedCode = parseDataAnalysis(llmResponse);
-    if (parsedCode === null || "error" in parsedCode) return parsedCode;
+    let parsedCode = parseDataAnalysis(llmResponse, filteredActions);
+    if (parsedCode === null) {
+      llmResponse = "";
+      streamInfo(nLoops <= 1 ? madeAMistake : anotherMistake);
+      continue;
+    }
+    if ("error" in parsedCode) return parsedCode;
     console.info("Parsed LLM response:", parsedCode.code);
 
     // Send code to supabase edge function to execute
@@ -144,9 +151,9 @@ export async function runDataAnalysis(
         actionsPlusApi: filteredActions,
         org,
         code: parsedCode.code,
+        userApiKey,
       }),
     });
-    nLoops += 1;
 
     if (res.error) {
       console.error(
@@ -159,9 +166,9 @@ export async function runDataAnalysis(
 
     const returnedData = res.data as ExecuteCode2Item[] | null;
     // If data field is null
-    if (returnedData === null) {
+    if (returnedData === null || returnedData.length === 0) {
       console.error(
-        `Failed to write valid code for conversation ${conversationId} after 3 attempts`,
+        `Failed to write valid code for conversation ${conversationId}, attempt ${nLoops}/3`,
       );
       llmResponse = "";
       streamInfo(nLoops <= 1 ? madeAMistake : anotherMistake);
@@ -171,7 +178,7 @@ export async function runDataAnalysis(
     const errorMessages = returnedData.filter((m) => m.type === "error");
     if (errorMessages.length > 0) {
       console.error(
-        `Error executing code for conversation ${conversationId}:\n${errorMessages
+        `Error executing code for conversation ${conversationId}, attempt ${nLoops}/3:\n${errorMessages
           // @ts-ignore
           .map((m) => m.args.message)
           .join("\n")}`,
@@ -180,17 +187,17 @@ export async function runDataAnalysis(
       streamInfo(nLoops <= 1 ? madeAMistake : anotherMistake);
       continue;
     }
-    // If 1 plot with either no data or not x & y in data
-    const plotMessages = returnedData.filter((m) => m.type === "error");
+    // If 1 plot with missing data
+    const plotMessages = returnedData.filter((m) => m.type === "plot");
     if (plotMessages.length === 1) {
       const plotArgs = plotMessages[0].args as BertieGraphData;
       if (
-        // Not x & y in data (exception is if it's a table)
-        plotArgs.type !== "table" &&
-        !plotArgs.data.every((d) => "x" in d && "y" in d)
+        // No data (exception is if it's a table or value)
+        (plotArgs.type !== "table" || plotArgs.data.length === 1) &&
+        !plotArgs.data.some((d) => Object.keys(d).length > 1)
       ) {
         console.error(
-          `Missing columns in data output by code for conversation ${conversationId}:\n${plotMessages
+          `Missing columns in data output by code for conversation ${conversationId}, attempt ${nLoops}/3:\n${plotMessages
             // @ts-ignore
             .map((m) => m.args.message)
             .join("\n")}`,
@@ -202,7 +209,17 @@ export async function runDataAnalysis(
     }
 
     graphData = returnedData;
-    console.info("Data analysis response: ", graphData);
+    console.info(
+      "Data analysis response:",
+      graphData.map((item) =>
+        item.type === "plot"
+          ? {
+              type: item.type,
+              args: { ...item.args, data: item.args.data?.slice(0, 5) },
+            }
+          : item,
+      ),
+    );
   }
   if (graphData === null) {
     console.error(
@@ -289,7 +306,7 @@ export function convertToGraphData(
         role: "graph",
         content: {
           type: g.args.data.length === 1 ? "value" : g.args.type,
-          data: g.args.data,
+          data: ensureDataWellFormatted(g.args),
           xLabel: g.args.labels?.x ?? "",
           yLabel: g.args.labels?.y ?? "",
           graphTitle: g.args.title,
@@ -307,4 +324,72 @@ export function convertToGraphData(
   }
 
   return [functionMessage, ...plotMessages];
+}
+
+export function ensureDataWellFormatted(
+  graphData: BertieGraphData,
+): BertieGraphData["data"] {
+  /** If there is no x and y in the data and it's not a table, we want to convert it to having
+   *  x and y.
+   *
+   *  1. We first check the labels and match against the keys in the data. If the labels
+   *  are the same as the keys, we convert these to x & y.
+   *  2. If the labels are not the same as the keys, we go on the order of key-value pairs in
+   *  the data and convert the first key to x and the second key to y.
+   * **/
+  if (
+    graphData.type === "table" ||
+    graphData.data.some((item) => "x" in item && "y" in item)
+  ) {
+    return graphData.data;
+  }
+
+  // Either x or y is missing from all data points - we want to make a mapping
+  const mapping: { x?: string; y?: string } = {}; // E.g. { "x": "date", "y": "value" }
+  const xMissing = graphData.data.every((item) => !("x" in item));
+  const yMissing = graphData.data.every((item) => !("y" in item));
+
+  // First, check the labels to see if we can work out what x and y should be
+  const keys = new Set();
+  graphData.data.forEach((item) => {
+    Object.keys(item).forEach((key) => keys.add(key));
+  });
+  const xLabel = graphData.labels.x;
+  if (xMissing) {
+    if (keys.has(xLabel)) {
+      mapping.x = xLabel;
+    } else if (keys.has(xLabel.toLowerCase())) {
+      mapping.x = xLabel.toLowerCase();
+    }
+  }
+  // Below we remove the units from the labels (look for something in brackets and cut it)
+  const yLabel = graphData.labels.y.match(/([^(]*)(?: \(.+\))?$/)?.[1] ?? "";
+  if (yMissing) {
+    if (keys.has(yLabel)) {
+      mapping.y = yLabel;
+    } else if (keys.has(yLabel.toLowerCase())) {
+      mapping.y = yLabel.toLowerCase();
+    }
+  }
+
+  // If the labels haven't helped, we'll just use the first key as x and the second as y
+  if (xMissing && !("x" in mapping)) {
+    const key = Array.from(keys)[0] as string;
+    mapping.x = key;
+    keys.delete(key);
+  }
+  if (yMissing && !("y" in mapping)) {
+    let key = Array.from(keys)[0] as string;
+    if (key === "x") key = Array.from(keys)[1] as string;
+    mapping.y = key;
+  }
+
+  // Use the mapping to update the data
+  Object.entries(mapping).forEach(([key, value]) => {
+    graphData.data.forEach((item) => {
+      item[key] = item[value];
+      delete item[value];
+    });
+  });
+  return graphData.data;
 }

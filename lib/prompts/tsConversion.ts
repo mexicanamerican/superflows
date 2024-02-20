@@ -202,12 +202,12 @@ export function getActionTSSignature(
   const description = formatDescriptionTS(action.description).slice(4);
 
   const out = `${
-    description ? `\n/** ${description.split("\n").join("\n* ")} **/\n` : ""
+    description ? `/** ${description.split("\n").join("\n* ")} **/\n` : ""
   }${isAsync ? "async " : ""}function ${snakeToCamel(action.name)}(${
     paramString ? "args: {" + paramString + "\n}" : ""
   })`;
 
-  if (!includeReturnType) return out + "\n";
+  if (!includeReturnType) return out;
 
   // Add return type
   // @ts-ignore
@@ -244,7 +244,7 @@ export function getActionTSSignature(
   }
   // Set to any as fallback
   returnType = returnType || "any";
-  return out + ": " + returnType + "\n";
+  return out + ": " + returnType;
 }
 
 export function getActionTSSignatures(
@@ -259,7 +259,7 @@ export function getActionTSSignatures(
 
   return actions
     .map((action) => getActionTSSignature(action, includeReturnType))
-    .join("");
+    .join("\n\n");
 }
 
 export function getObjectTSType(object: any): string {
