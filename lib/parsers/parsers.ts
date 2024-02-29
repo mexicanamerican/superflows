@@ -33,6 +33,34 @@ export function parseGPTStreamedData(gptOutString: string): ParsedStreamedData {
   return output;
 }
 
+export function parseAnthropicStreamedData(
+  claudeOutString: string,
+): ParsedStreamedData {
+  const output = {
+    completeChunks: [] as string[],
+    incompleteChunk: null,
+    done: false,
+  } as ParsedStreamedData;
+
+  claudeOutString
+    .split("event: ")
+    .filter((l: string) => l.trim())
+    .forEach((line: string) => {
+      try {
+        const parsedLine = JSON.parse(line.match(/\{[^}]*}/)![0].trim());
+        const choice = parsedLine.completion;
+        if (choice) output.completeChunks.push(choice);
+        if (parsedLine.stop_reason) {
+          output.done = true;
+        }
+      } catch (e) {
+        output.incompleteChunk = line;
+        return output;
+      }
+    });
+  return output;
+}
+
 export function parseFollowUpSuggestions(text: string): string[] {
   const suggestedQuestionRegex =
     /^([Ss]uggested [Qq]uestion|Suggestion) (\d: |\d\?)/;

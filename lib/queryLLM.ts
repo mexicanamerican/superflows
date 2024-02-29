@@ -1,4 +1,5 @@
 import {
+  AnthropicResponse,
   ChatGPTMessage,
   ChatGPTParams,
   ChatGPTResponse,
@@ -41,9 +42,27 @@ export async function getLLMResponse(
       ? getOAIRequestCompletion(prompt, params, model)
       : getLLMRequestChat(prompt, params, model);
 
-  const response = await fetch(url, options);
+  const response = await Promise.race([
+    fetch(url, options),
+    (async () => {
+      // Time out after 30s
+      await new Promise((resolve) => setTimeout(resolve, 30000));
+      return new Response(
+        JSON.stringify({ error: { message: "Timed out!" } }),
+        {
+          status: 500,
+        },
+      );
+    })(),
+  ]);
   const responseJson: ChatGPTResponse | { error: OpenAIError } =
     await response.json();
+  if (response.status >= 300) {
+    console.log(
+      "Response from LLM: ",
+      JSON.stringify(responseJson, undefined, 2),
+    );
+  }
 
   if (response.status === 429) {
     // Throwing an error triggers exponential backoff retry
@@ -64,8 +83,13 @@ export async function getLLMResponse(
 }
 
 export function textFromResponse(
-  response: ChatGPTResponse | RunPodResponse | TogetherAIResponse,
+  response:
+    | ChatGPTResponse
+    | RunPodResponse
+    | TogetherAIResponse
+    | AnthropicResponse,
 ): string {
+  if ("completion" in response) return response.completion;
   if ("output" in response) {
     if (typeof response.output === "string") return response.output;
     // @ts-ignore
@@ -81,9 +105,7 @@ export async function streamLLMResponse(
   prompt: ChatGPTMessage[] | string,
   params: ChatGPTParams = {},
   model: string,
-): Promise<
-  ReadableStream | string | { message: string; status: number } | null
-> {
+): Promise<ReadableStream | { message: string; status: number } | null> {
   /** Have only tested on edge runtime endpoints - not 100% sure it will work on Node runtime **/
   if (typeof prompt === "string" && model !== "gpt-3.5-turbo-instruct")
     throw new Error(
@@ -109,11 +131,6 @@ export async function streamLLMResponse(
     const error = await response.json();
     console.error(`Error from ${model} LLM: ${JSON.stringify(error.error)}`);
     return { message: error.error, status: response.status };
-  }
-  if (response.headers.get("content-type")?.includes("application/json")) {
-    // Non-streaming
-    const out = await response.json();
-    return out.output;
   }
 
   return response.body;
@@ -164,7 +181,9 @@ function getLLMRequestChat(
   const isOpenAIModel = model.includes("gpt");
   const isMistralModel = model.includes("mistral");
   const isPhindModel = model.includes("Phind");
+  const isAnthropicModel = model.includes("anthropic");
   const isOS = isOSModel(model);
+
   let key: string, url: string;
   if (isOpenAIModel) {
     key = process.env.OPENAI_API_KEY!;
@@ -172,6 +191,8 @@ function getLLMRequestChat(
   } else if (isMistralModel) {
     key = process.env.MISTRAL_API_KEY!;
     url = "https://api.mistral.ai/v1/chat/completions";
+    delete defaultParams.frequency_penalty;
+    delete defaultParams.presence_penalty;
     // Mistral doesn't know about function messages & is fussy about only replying to user messages!
     // Below stringify-parse is deepcopy
     messages = JSON.parse(JSON.stringify(messages)).map((m: ChatGPTMessage) =>
@@ -179,6 +200,31 @@ function getLLMRequestChat(
         ? { ...m }
         : { role: "user", content: `${m.name} output: ${m.content}` },
     );
+  } else if (isAnthropicModel) {
+    const prompt = GPTChatFormatToClaudeInstant(messages);
+    const max_tokens_to_sample = params.max_tokens;
+    const stop_sequences = params.stop;
+    const localParams = { ...params };
+    delete localParams.max_tokens;
+    delete localParams.stop;
+    return {
+      url: "https://api.anthropic.com/v1/complete",
+      options: {
+        method: "POST",
+        headers: {
+          "x-api-key": process.env.ANTHROPIC_API_KEY ?? "",
+          "Content-Type": "application/json",
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          ...localParams,
+          max_tokens_to_sample,
+          stop_sequences,
+          model: model.split("/")[1],
+          prompt: prompt,
+        }),
+      },
+    };
   } else if (isPhindModel) {
     const phindParams = {
       ...defaultParams,
@@ -200,7 +246,7 @@ function getLLMRequestChat(
     }
     const promptText = GPTChatFormatToPhind(messages);
     // console.log("Prompt text: ", promptText);
-    const out = {
+    return {
       url: "https://api.together.xyz/inference",
       options: {
         method: "POST",
@@ -217,7 +263,6 @@ function getLLMRequestChat(
         }),
       },
     };
-    return out;
   } else if (isOS) {
     if (!process.env.OS_LLM_API_KEY || !process.env.OS_LLM_URL)
       throw new Error(
@@ -272,8 +317,6 @@ function getLLMRequestChat(
 const baseSecondaryModelMapping = {
   "gpt-4-0613": "gpt-3.5-turbo-0613",
   "anthropic/claude-2": "anthropic/claude-instant-v1",
-  "meta-llama/llama-2-70b-chat": "meta-llama/llama-2-70b-chat",
-  "google/palm-2-chat-bison": "google/palm-2-chat-bison",
 };
 
 export function getSecondaryModel(mainModel: string): string {
@@ -334,7 +377,7 @@ function combineMessagesForHFEndpoints(messages: LLMChatMessage[]): string {
     )
     .join("\n");
 }
-function GPTChatFormatToPhind(chatMessages: ChatGPTMessage[]): string {
+export function GPTChatFormatToPhind(chatMessages: ChatGPTMessage[]): string {
   const roleToName = {
     system: "System Prompt",
     user: "User Message",
@@ -356,4 +399,29 @@ ${
     ? "### Assistant\n"
     : ""
 }`;
+}
+
+export function GPTChatFormatToClaudeInstant(
+  chatMessages: ChatGPTMessage[],
+): string {
+  const roleToName = {
+    system: "",
+    user: "Human:\n",
+    assistant: "Assistant:\n",
+    function: "Function: ", // Should never be used in Claude Instant
+  };
+  if (chatMessages.filter((m) => m.role === "function").length > 0) {
+    throw new Error(
+      "Function messages are not supported in Claude Instant. Please remove them.",
+    );
+  }
+  const out = `${chatMessages
+    .map((message) => `${roleToName[message.role]}${message.content}`)
+    .join("\n\n")}`;
+  if (!out.includes("\n\nHuman:")) {
+    throw new Error(
+      "Claude Instant requires a user message. Please add a user message to the prompt.",
+    );
+  }
+  return out;
 }

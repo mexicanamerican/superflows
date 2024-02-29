@@ -6,7 +6,6 @@ import {
 import { ActionPlusApiInfo } from "../../types";
 import { exponentialRetryWrapper, snakeToCamel } from "../../utils";
 import { getLLMResponse } from "../../queryLLM";
-import { ChatGPTMessage } from "../../models";
 
 const defaultFilterParams = {
   temperature: 0.9,
@@ -15,16 +14,16 @@ const defaultFilterParams = {
 };
 
 export async function filterActions(
+  userRequest: string,
   actions: ActionPlusApiInfo[],
-  nonSystemMessages: ChatGPTMessage[],
   orgName: string,
   model: string,
 ): Promise<{ thoughts: string; actions: ActionPlusApiInfo[] }> {
   const actionFilterPrompt = actionFilteringPrompt({
+    userRequest,
     actionDescriptions: actions.map(
       (a) => `${snakeToCamel(a.name)}: ${a.filtering_description}`,
     ),
-    nonSystemMessages,
     orgName,
   });
   console.log(actionFilterPrompt[0].content);
@@ -33,13 +32,22 @@ export async function filterActions(
     await Promise.all(
       [1, 2, 3].map(async (i) => {
         console.log(`Running LLM ${i}`);
-        const out = await exponentialRetryWrapper(
+        let out = await exponentialRetryWrapper(
           getLLMResponse,
           [actionFilterPrompt, defaultFilterParams, model],
           3,
         );
         console.log(`LLM ${i} output:`, out);
-        if (out === "") return null;
+        // If no output, retry
+        if (out === "") {
+          console.log("Retrying filtering prompt");
+          out = await exponentialRetryWrapper(
+            getLLMResponse,
+            [actionFilterPrompt, defaultFilterParams, model],
+            3,
+          );
+          console.log(`LLM ${i} output #2:`, out);
+        }
         return parseActionFilteringOutput(
           out,
           actions.map((a) => snakeToCamel(a.name)),

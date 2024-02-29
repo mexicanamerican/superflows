@@ -65,6 +65,14 @@ export class LlmResponseCache {
             matchingChat.length > 1 &&
             !["", userMessage].includes(matchingChat[1].content)
           ) {
+            // Sometimes due to errors, there are gaps in the conversation index, we cut
+            //  the history to where these gaps are
+            const cutIdx = matchingChat.findIndex(
+              (m, idx) => m.conversation_index !== idx,
+            );
+            if (cutIdx !== -1) {
+              matchingChat.splice(cutIdx);
+            }
             console.log("Found matching conversation:", matchingChat);
             this.matchConvId = convId;
             this.messages = matchingChat as GPTMessageInclSummary[];
@@ -79,8 +87,8 @@ export class LlmResponseCache {
   }
 
   _history_matches(chatHistory: GPTMessageInclSummary[]): boolean {
-    // If cache conversation length less than current convo length, no match
-    if (this.messages.length < chatHistory.length) return false;
+    // If cache conversation length less than current convo length or the same (no new messages), no match
+    if (this.messages.length <= chatHistory.length) return false;
 
     return chatHistory.every((m, idx) => {
       const msg = this.messages[idx];
@@ -118,7 +126,7 @@ export class LlmResponseCache {
     if (isMatch) {
       console.log("Chat output match found - returning cached message");
       const matchingMessage = this.messages[chatHistory.length];
-      return matchingMessage.content;
+      return matchingMessage?.content ?? "";
     }
     this.messages = [];
     return "";

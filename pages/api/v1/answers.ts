@@ -30,6 +30,7 @@ import {
 export const config = {
   runtime: "edge",
   // Edge gets upset with our use of recharts in chat-ui-react.
+  regions: ["iad1", "cle1"],
   // TODO: Make it possible to import chat-ui-react without recharts
   unstable_allowDynamic: [
     "**/node_modules/@superflows/chat-ui-react/**",
@@ -145,7 +146,9 @@ export default async function handler(req: NextRequest) {
       if (!org) {
         const authRes = await supabase
           .from("organizations")
-          .select("*, is_paid(*), finetuned_models(*)")
+          .select(
+            "id,name,api_key,description,model,sanitize_urls_first,language,chat_to_docs_enabled,chatbot_instructions,bertie_enabled, is_paid(is_premium), finetuned_models(openai_name)",
+          )
           .eq("api_key", orgApiKey);
         if (authRes.error) throw new Error(authRes.error.message);
         // Set org in Redis for 30 minutes
@@ -288,12 +291,6 @@ export default async function handler(req: NextRequest) {
         previousMessages = conversation;
         // If the language is set for any message in the conversation, use that
         language = convResp.data.find((m) => !!m.language)?.language ?? null;
-        // Set previous messages in Redis for 30 minutes
-        redis?.setex(
-          `chat_messages_${org.id}_${requestData.conversation_id}`,
-          60 * 30,
-          JSON.stringify({ previousMessages, language }),
-        );
       }
     } else {
       // TODO: Move to the end
@@ -311,8 +308,8 @@ export default async function handler(req: NextRequest) {
     // If the language is not set, try to detect it using detectlanguage.com
     if (org.language !== "Detect Language") {
       language = org.language;
-    } else if (!language && process.env.NEXT_PUBLIC_DETECT_LANGUAGE_KEY) {
-      language = await getLanguage(requestData.user_input);
+      // } else if (!language && process.env.NEXT_PUBLIC_DETECT_LANGUAGE_KEY) {
+      //   language = await getLanguage(requestData.user_input);
     }
 
     if (requestData.user_input) {
@@ -491,24 +488,34 @@ export default async function handler(req: NextRequest) {
               language,
               currentHost,
             );
-        const insertedChatMessagesRes = await supabase
-          .from("chat_messages")
-          .insert(
-            allMessages.slice(previousMessages.length).map((m, idx) => {
+        await supabase.from("chat_messages").insert(
+          allMessages.slice(previousMessages.length).map((m, idx) => {
+            if (m.role === "function" && m.content.length > 10000) {
+              m.content = ApiResponseCutText;
+            }
+            return {
+              ...m,
+              org_id: org!.id,
+              conversation_id: conversationId,
+              conversation_index: previousMessages.length + idx,
+              language,
+            };
+          }),
+        );
+        // Set previous messages in Redis for 30 minutes
+        redis?.setex(
+          `chat_messages_${org!.id}_${conversationId}`,
+          60 * 30,
+          JSON.stringify({
+            previousMessages: allMessages.map((m) => {
               if (m.role === "function" && m.content.length > 10000) {
                 m.content = ApiResponseCutText;
               }
-              return {
-                ...m,
-                org_id: org!.id,
-                conversation_id: conversationId,
-                conversation_index: previousMessages.length + idx,
-                language,
-              };
+              return m;
             }),
-          );
-        if (insertedChatMessagesRes.error)
-          throw new Error(insertedChatMessagesRes.error.message);
+            language,
+          }),
+        );
 
         if (
           process.env.CONTEXT_API_KEY &&

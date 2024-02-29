@@ -51,7 +51,12 @@ import {
 } from "@superflows/chat-ui-react/dist/src/lib/types";
 import { LlmResponseCache } from "../../edge-runtime/llmResponseCache";
 import { storeActionsAwaitingConfirmation } from "../../edge-runtime/ai";
-import { getSearchDocsAction } from "../../builtinActions";
+import {
+  getSearchDocsAction,
+  searchDocsActionName,
+} from "../../builtinActions";
+import { runClarificationAndStreamResponse } from "./clarification";
+import { summariseChatHistory } from "./summariseChatHistory";
 
 let redis: Redis | null = null;
 if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
@@ -120,8 +125,8 @@ export async function Bertie( // Bertie will eat you for breakfast
   console.log("Bertie will eat you for breakfast");
   const streamInfo = await preamble(controller, conversationId);
 
-  let nonSystemMessages = [...previousMessages];
-  const model = org.model;
+  let chatHistory = [...previousMessages];
+  let model = org.model;
   // GPT4 can deal with longer context window better
   const maxConvLength = model === "gpt-4" ? 20 : 14;
   let mostRecentParsedOutput = {
@@ -141,24 +146,53 @@ export async function Bertie( // Bertie will eat you for breakfast
   await chatMessageCache.initialize(
     reqData.user_input,
     org.id,
-    nonSystemMessages.length - 1,
+    chatHistory.length - 1,
     supabase,
   );
   // This allows us to add the 'Search docs' action if it's enabled
   if (org.chat_to_docs_enabled) {
     actions.unshift(getSearchDocsAction(org, currentHost));
   }
-
-  let thoughts = "";
-  if (actions.length > 2) {
-    ({ thoughts, actions } = await filterActions(
-      actions,
-      nonSystemMessages,
-      org!.name,
-      FASTMODEL,
-    ));
-    // TODO: Deal with the situation where all the actions are filtered out!
+  // If there are multiple messages in the chat history, we summarise the chat history into a single user
+  //  request - this makes future prompts have a _much_ easier time understanding the user's request
+  let userRequest = reqData.user_input;
+  if (previousMessages.length > 1) {
+    userRequest = await summariseChatHistory(chatHistory, language);
   }
+
+  const clarificationOutput = await runClarificationAndStreamResponse({
+    userRequest,
+    actions,
+    orgInfo: org,
+    userDescription: reqData.user_description ?? "",
+    conversationId,
+    language,
+    streamInfo,
+  });
+  console.log("Clarification output:", clarificationOutput);
+  if (!clarificationOutput.clear || !clarificationOutput.possible) {
+    chatHistory.push(clarificationOutput.message!);
+    return {
+      nonSystemMessages: chatHistory,
+      cost: totalCost,
+      numUserQueries,
+    };
+  }
+  actions = clarificationOutput.actions.filter(
+    (a) => a.name !== searchDocsActionName,
+  );
+  let thoughts = clarificationOutput.thoughts;
+
+  // let thoughts = "";
+  // if (actions.length > 2) {
+  //   ({ thoughts, actions } = await filterActions(
+  //     userRequest,
+  //     actions,
+  //     org!.name,
+  //     FASTMODEL,
+  //   ));
+  //   // TODO: Deal with the situation where all the actions are filtered out!
+  // }
   let codeGenCalled = false;
 
   // Add analytics action if enabled
@@ -173,14 +207,14 @@ export async function Bertie( // Bertie will eat you for breakfast
       }
       console.log(
         "\n\nNum of non system messages:",
-        nonSystemMessages.length,
+        chatHistory.length,
         "with types:",
-        nonSystemMessages.map((m) => m.role),
+        chatHistory.map((m) => m.role),
       );
 
       // To stop going over the context limit: only remember the last 'maxConvLength' messages
-      const recentMessages = nonSystemMessages
-        .slice(Math.max(0, nonSystemMessages.length - maxConvLength))
+      const recentMessages = chatHistory
+        .slice(Math.max(0, chatHistory.length - maxConvLength))
         // Set summaries to 'content' - don't show AI un-summarized output
         .map(MessageInclSummaryToGPT);
 
@@ -218,7 +252,7 @@ export async function Bertie( // Bertie will eat you for breakfast
         "\n\n",
       );
 
-      let rawOutput = chatMessageCache.checkChatCache(nonSystemMessages);
+      let rawOutput = chatMessageCache.checkChatCache(chatHistory);
       if (rawOutput) {
         streamInfo({
           role: "assistant",
@@ -239,7 +273,11 @@ export async function Bertie( // Bertie will eat you for breakfast
             content:
               "Your organization has too many actions enabled to complete this request. Disable some actions or contact your IT team.",
           });
-          return { nonSystemMessages, cost: totalCost, numUserQueries };
+          return {
+            nonSystemMessages: chatHistory,
+            cost: totalCost,
+            numUserQueries,
+          };
         }
 
         const promptInputCost = openAiCost(chatGptPrompt, "in", model);
@@ -248,15 +286,10 @@ export async function Bertie( // Bertie will eat you for breakfast
 
         const res = await exponentialRetryWrapper(
           streamLLMResponse,
-          // No actions means it's explaining a graph output to the user
-          [
-            chatGptPrompt,
-            completionOptions,
-            actions.length > 0 ? model : FASTMODEL,
-          ],
+          [chatGptPrompt, completionOptions, model],
           3,
         );
-        if (res === null || (typeof res !== "string" && "message" in res)) {
+        if (res === null || "message" in res) {
           console.error(
             `Language Model API call failed for conversation with id: ${conversationId}. The error was: ${JSON.stringify(
               res,
@@ -266,21 +299,19 @@ export async function Bertie( // Bertie will eat you for breakfast
             role: "error",
             content: "Call to Language Model API failed",
           });
-          return { nonSystemMessages, cost: totalCost, numUserQueries };
+          return {
+            nonSystemMessages: chatHistory,
+            cost: totalCost,
+            numUserQueries,
+          };
         }
 
-        if (typeof res === "string") {
-          // If non-streaming response, just return the full output
-          rawOutput = res;
-          streamInfo({ role: "assistant", content: res });
-        } else {
-          // Stream response chunk by chunk
-          rawOutput = await streamResponseToUser(
-            res,
-            streamInfo,
-            originalToPlaceholderMap,
-          );
-        }
+        // Stream response chunk by chunk
+        rawOutput = await streamResponseToUser(
+          res,
+          streamInfo,
+          originalToPlaceholderMap,
+        );
       }
 
       const newMessage = {
@@ -298,7 +329,7 @@ export async function Bertie( // Bertie will eat you for breakfast
       if (mostRecentParsedOutput.commands?.length > 0) numUserQueries = 1;
 
       // Add assistant message to nonSystemMessages
-      nonSystemMessages.push(newMessage);
+      chatHistory.push(newMessage);
 
       const functionMessages: Record<string, FunctionMessageInclSummary> = {};
       const toUserCorrect: { functionName: string; param: string }[] = [];
@@ -369,7 +400,7 @@ export async function Bertie( // Bertie will eat you for breakfast
               // Update the past assistant message with all newly-added parameters (so it looks to future AI
               //  that it got the call right first time - stops it thinking it can skip required parameters).
               //  All are added since `command.args` has all the newly-added parameters
-              updatePastAssistantMessage(command, nonSystemMessages);
+              updatePastAssistantMessage(command, chatHistory);
             }
 
             if (needsUserCorrection) {
@@ -447,9 +478,7 @@ export async function Bertie( // Bertie will eat you for breakfast
       ).filter((x) => x !== undefined);
 
       // This adds function outputs in the order they were called by the LLM
-      nonSystemMessages = nonSystemMessages.concat(
-        sortObjectToArray(functionMessages),
-      );
+      chatHistory = chatHistory.concat(sortObjectToArray(functionMessages));
 
       // Below checks for if there are any 'needs correction' messages
       const anyNeedCorrection = commandMapOutput.some(
@@ -474,7 +503,7 @@ export async function Bertie( // Bertie will eat you for breakfast
               ", ",
             )}\n\nIf you want to call the function again, ask the user for the missing parameters"`,
           } as FunctionMessage;
-          nonSystemMessages.push(missingParamsMessage);
+          chatHistory.push(missingParamsMessage);
           streamInfo(missingParamsMessage);
         });
       }
@@ -505,13 +534,12 @@ export async function Bertie( // Bertie will eat you for breakfast
       };
       if (dataAnalysisAction && !anyNeedCorrection && toConfirm.length === 0) {
         console.log("Running data analysis!");
-        streamInfo({ role: "loading", content: "Performing complex action" });
         const graphData = await runDataAnalysis(
           dataAnalysisAction.args["instruction"],
           [...actions.slice(1)],
           // nonSystemMessages,
           org,
-          { conversationId, index: nonSystemMessages.length },
+          { conversationId, index: chatHistory.length },
           reqData.user_description ?? "",
           chatMessageCache,
           thoughts,
@@ -521,21 +549,22 @@ export async function Bertie( // Bertie will eat you for breakfast
         );
         // Make last message an explanation-only message
         codeGenCalled = true;
+        model = FASTMODEL;
 
         // Return graph data to the user & add message to chat history
         if (graphData === null) {
           fnMsg.content = "Failed to run data analysis";
           streamInfo(fnMsg);
-          nonSystemMessages.push(fnMsg);
+          chatHistory.push(fnMsg);
         } else if ("error" in graphData) {
           // Handle error - add function message
           fnMsg.content = graphData.error;
           streamInfo(fnMsg);
-          nonSystemMessages.push(fnMsg);
+          chatHistory.push(fnMsg);
         } else {
           const graphDataArr = convertToGraphData(graphData);
           graphDataArr.map(streamInfo);
-          nonSystemMessages = nonSystemMessages.concat(
+          chatHistory = chatHistory.concat(
             graphDataArr.map((m) => ({
               role: "function",
               name: dataAnalysisActionName,
@@ -550,16 +579,20 @@ export async function Bertie( // Bertie will eat you for breakfast
       } else if (dataAnalysisAction) {
         if (anyNeedCorrection) {
           fnMsg.content = "Error: other function calls need user correction";
-          nonSystemMessages.push(fnMsg);
+          chatHistory.push(fnMsg);
         } else if (toConfirm.length !== 0) {
           fnMsg.content =
             "Error: another function call requires user confirmation";
-          nonSystemMessages.push(fnMsg);
+          chatHistory.push(fnMsg);
         }
       }
 
       if (mostRecentParsedOutput.completed) {
-        return { nonSystemMessages, cost: totalCost, numUserQueries };
+        return {
+          nonSystemMessages: chatHistory,
+          cost: totalCost,
+          numUserQueries,
+        };
       }
 
       numOpenAIRequests++;
@@ -572,7 +605,11 @@ export async function Bertie( // Bertie will eat you for breakfast
           role: "error",
           content: "OpenAI API call limit reached",
         });
-        return { nonSystemMessages, cost: totalCost, numUserQueries };
+        return {
+          nonSystemMessages: chatHistory,
+          cost: totalCost,
+          numUserQueries,
+        };
       }
     }
   } catch (e) {
@@ -581,9 +618,9 @@ export async function Bertie( // Bertie will eat you for breakfast
       role: "error",
       content: e?.toString() ?? "Internal server error",
     });
-    return { nonSystemMessages, cost: totalCost, numUserQueries };
+    return { nonSystemMessages: chatHistory, cost: totalCost, numUserQueries };
   }
-  return { nonSystemMessages, cost: totalCost, numUserQueries };
+  return { nonSystemMessages: chatHistory, cost: totalCost, numUserQueries };
 }
 
 async function preamble(
