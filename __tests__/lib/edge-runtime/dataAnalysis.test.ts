@@ -350,4 +350,50 @@ describe("checkCodeExecutionOutput", () => {
       ),
     ).toBe(false);
   });
+  it("API call & plot, borked data", () => {
+    expect(
+      checkCodeExecutionOutput(
+        [
+          {
+            type: "call",
+            args: {
+              name: "getInventoryProjections",
+              params: { includeProjections: "true" },
+            },
+          },
+          {
+            type: "plot",
+            args: {
+              title: "Stock Levels by Product Categories",
+              type: "bar",
+              data: [
+                { category: "undefined", totalUnits: null, totalCost: null },
+              ],
+              labels: { x: "Product Category", y: "Total Units" },
+            },
+          },
+        ],
+        1,
+      ),
+    ).toEqual(false);
+  });
+  it("API call & plot, bad value data", () => {
+    expect(
+      checkCodeExecutionOutput(
+        [
+          { type: "call", args: { name: "getInventorySummary", params: {} } },
+          {
+            type: "plot",
+            args: {
+              title: "Frozen Units Percentage",
+              type: "bar",
+              data: [{ x: "Frozen Units", y: null }],
+              labels: { x: "Percentage (%)", y: "Value" },
+            },
+          },
+        ],
+        1,
+      ),
+    ).toEqual(false);
+  });
 });

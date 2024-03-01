@@ -77,31 +77,17 @@ const anotherMistake = {
 export async function runDataAnalysis(
   instruction: string,
   filteredActions: ActionPlusApiInfo[],
-  // fullChatHistory: GPTMessageInclSummary[],
   org: Pick<Organization, "id" | "name" | "description">,
   dbData: { conversationId: number; index: number },
   userDescription: string,
   cache: LlmResponseCache,
-  thoughts: string,
-  conversationId: number,
+  thoughts: string[],
   streamInfo: (step: StreamingStepInput) => void,
   userApiKey?: string,
 ): Promise<ExecuteCode2Item[] | { error: string } | null> {
   streamInfo({ role: "loading", content: "Performing data analysis" });
-  const dataAnalysisPrompt = getDataAnalysisPrompt({
-    question: instruction,
-    selectedActions: filteredActions,
-    orgInfo: org,
-    userDescription,
-    thoughts,
-  });
-  console.log(
-    "Data analysis prompt:",
-    JSON.stringify(GPTChatFormatToPhind(dataAnalysisPrompt)),
-  );
-
   let llmResponse = await cache.checkBertieAnalyticsCache(
-    dataAnalysisPrompt[1].content,
+    instruction,
     filteredActions.map((a) => a.name),
     org.id,
     supabase,
@@ -125,11 +111,14 @@ export async function runDataAnalysis(
 
       if (!res.error) {
         const returnedData = res.data as ExecuteCode2Item[] | null;
-        const codeOk = checkCodeExecutionOutput(returnedData, conversationId);
+        const codeOk = checkCodeExecutionOutput(
+          returnedData,
+          dbData.conversationId,
+        );
         if (codeOk) {
           // Save to DB for possible reuse later - run async
           void saveAnalyticsToDB(
-            dataAnalysisPrompt[1].content,
+            instruction,
             llmResponse,
             org.id,
             dbData,
@@ -140,99 +129,138 @@ export async function runDataAnalysis(
         }
       }
       console.error(
-        `Error executing code for conversation ${conversationId}: ${res.error}`,
+        `Error executing code for conversation ${dbData.conversationId}: ${res.error}`,
       );
     }
   }
-  var promiseFinished = false;
-  const graphData = await Promise.race(
-    [1, 2, 3].map(async (i) => {
-      console.log("\nCode gen run", i);
-      let parallelGraphData: ExecuteCode2Item[] | null = null,
-        nLoops = 0;
-      while (parallelGraphData === null && nLoops < 3 && !promiseFinished) {
-        defaultDataAnalysisParams = {
-          ...defaultDataAnalysisParams,
-          temperature: nLoops === 0 && i === 0 ? 0.1 : 0.8,
-        };
-        nLoops += 1;
-        const parallelLlmResponse = await exponentialRetryWrapper(
-          getLLMResponse,
-          [
-            dataAnalysisPrompt,
-            defaultDataAnalysisParams,
-            process.env.CODE_GEN_LLM ?? defaultCodeGenModel,
-          ],
-          3,
-        );
-        console.info("\nRaw LLM response:", parallelLlmResponse);
 
-        // Parse the result
-        let parsedCode = parseDataAnalysis(
-          parallelLlmResponse,
-          filteredActions,
-        );
-        if (parsedCode === null) {
-          streamInfo(nLoops <= 1 ? madeAMistake : anotherMistake);
-          continue;
-        }
-        if ("error" in parsedCode) return parsedCode;
-        if (promiseFinished) return { error: "Another promise settled first" };
-        streamInfo({ role: "loading", content: "Executing code" });
-        console.info("Parsed LLM response:", parsedCode.code);
-
-        // Send code to supabase edge function to execute
-        const res = await supabase.functions.invoke("execute-code-2", {
-          body: JSON.stringify({
-            actionsPlusApi: filteredActions,
-            org,
-            code: parsedCode.code,
-            userApiKey,
-          }),
-        });
-        if (promiseFinished) return { error: "Another promise settled first" };
-
-        if (res.error) {
-          console.error(
-            `Error executing code for conversation ${conversationId}: ${res.error}`,
-          );
-          streamInfo(nLoops <= 1 ? madeAMistake : anotherMistake);
-          continue;
-        }
-
-        const returnedData = res.data as ExecuteCode2Item[] | null;
-        const codeOk = checkCodeExecutionOutput(
-          returnedData,
-          conversationId,
-          nLoops,
-        );
-        if (!codeOk) {
-          streamInfo(nLoops <= 1 ? madeAMistake : anotherMistake);
-          continue;
-        }
-        // For type-safety (doesn't ever get called)
-        if (returnedData === null) continue;
-
-        parallelGraphData = returnedData;
-      }
-      if (!promiseFinished) {
-        if (parallelGraphData === null) {
-          console.error(
-            `Failed to execute code for conversation ${conversationId} after 3 attempts`,
-          );
-          return { error: "Failed to execute code" };
-        }
-        console.log(`Async run ${i} succeeded`);
-        promiseFinished = true;
-        return parallelGraphData;
-      }
-      return {
-        error:
-          "Another promise settled first - this should never be in the logs",
-      };
-    }),
+  console.log(
+    "Data analysis prompt:",
+    JSON.stringify(
+      GPTChatFormatToPhind(
+        getDataAnalysisPrompt({
+          question: instruction,
+          selectedActions: filteredActions,
+          orgInfo: org,
+          userDescription,
+          thoughts: thoughts[0],
+        }),
+      ),
+    ),
   );
-  if ("error" in graphData) return { error: "Failed to execute code" };
+  var promiseFinished = false;
+  const promiseOut = await Promise.race(
+    [1, 2, 3].map(
+      async (
+        i,
+      ): Promise<
+        | { graphData: ExecuteCode2Item[]; llmResponse: string }
+        | { error: string }
+      > => {
+        const dataAnalysisPrompt = getDataAnalysisPrompt({
+          question: instruction,
+          selectedActions: filteredActions,
+          orgInfo: org,
+          userDescription,
+          thoughts: thoughts[(i - 1) % thoughts.length],
+        });
+        console.log("\nCode gen run", i);
+        let parallelGraphData: ExecuteCode2Item[] | null = null,
+          nLoops = 0;
+        let parallelLlmResponse = "";
+        while (parallelGraphData === null && nLoops < 3 && !promiseFinished) {
+          defaultDataAnalysisParams = {
+            ...defaultDataAnalysisParams,
+            temperature: nLoops === 0 && i === 0 ? 0.1 : 0.8,
+          };
+          nLoops += 1;
+          parallelLlmResponse = await exponentialRetryWrapper(
+            getLLMResponse,
+            [
+              dataAnalysisPrompt,
+              defaultDataAnalysisParams,
+              process.env.CODE_GEN_LLM ?? defaultCodeGenModel,
+            ],
+            3,
+          );
+          if (promiseFinished)
+            return { error: "Another promise settled first" };
+          console.info("\nRaw LLM response:", parallelLlmResponse);
+
+          // Parse the result
+          let parsedCode = parseDataAnalysis(
+            parallelLlmResponse,
+            filteredActions,
+          );
+          if (parsedCode === null) {
+            streamInfo(nLoops <= 1 ? madeAMistake : anotherMistake);
+            continue;
+          }
+          if ("error" in parsedCode) return parsedCode;
+          if (promiseFinished)
+            return { error: "Another promise settled first" };
+          streamInfo({ role: "loading", content: "Executing code" });
+          console.info("Parsed LLM response:", parsedCode.code);
+
+          // Send code to supabase edge function to execute
+          const res = await supabase.functions.invoke("execute-code-2", {
+            body: JSON.stringify({
+              actionsPlusApi: filteredActions,
+              org,
+              code: parsedCode.code,
+              userApiKey,
+            }),
+          });
+          if (promiseFinished)
+            return { error: "Another promise settled first" };
+
+          if (res.error) {
+            console.error(
+              `Error executing code for conversation ${dbData.conversationId}: ${res.error}`,
+            );
+            streamInfo(nLoops <= 1 ? madeAMistake : anotherMistake);
+            continue;
+          }
+
+          const returnedData = res.data as ExecuteCode2Item[] | null;
+          const codeOk = checkCodeExecutionOutput(
+            returnedData,
+            dbData.conversationId,
+            nLoops,
+          );
+          if (!codeOk) {
+            streamInfo(nLoops <= 1 ? madeAMistake : anotherMistake);
+            continue;
+          }
+          // For type-safety (doesn't ever get called)
+          if (returnedData === null) continue;
+
+          parallelGraphData = returnedData;
+        }
+        if (!promiseFinished) {
+          if (parallelGraphData === null) {
+            console.error(
+              `Failed to execute code for conversation ${dbData.conversationId} after 3 attempts`,
+            );
+            return { error: "Failed to execute code" };
+          }
+          console.log(`Async run ${i} succeeded`);
+          promiseFinished = true;
+          return {
+            graphData: parallelGraphData,
+            llmResponse: parallelLlmResponse,
+          };
+        }
+        return {
+          error:
+            "Another promise settled first - this should never be in the logs",
+        };
+      },
+    ),
+  );
+  promiseFinished = true;
+  if ("error" in promiseOut) return { error: "Failed to execute code" };
+  const graphData = promiseOut.graphData;
   console.info(
     "Data analysis response:",
     graphData.map((item) =>
@@ -241,13 +269,24 @@ export async function runDataAnalysis(
             type: item.type,
             args: { ...item.args, data: item.args.data?.slice(0, 5) },
           }
+        : item.type === "call"
+        ? {
+            type: item.type,
+            args: {
+              ...item.args,
+              params: JSON.stringify(item.args.params, undefined, 2).slice(
+                0,
+                200,
+              ),
+            },
+          }
         : item,
     ),
   );
   // Save to DB for possible reuse later - run async
   void saveAnalyticsToDB(
-    dataAnalysisPrompt[1].content,
-    llmResponse,
+    instruction,
+    promiseOut.llmResponse,
     org.id,
     dbData,
     true,
@@ -264,7 +303,7 @@ export function checkCodeExecutionOutput(
   // If data field is null
   if (returnedData === null || returnedData.length === 0) {
     console.error(
-      `Failed to write valid code for conversation ${conversationId}${
+      `ERROR: Failed to write valid code for conversation ${conversationId}${
         nLoops ? `, attempt ${nLoops}/3` : ""
       }`,
     );
@@ -274,7 +313,7 @@ export function checkCodeExecutionOutput(
   const errorMessages = returnedData.filter((m) => m.type === "error");
   if (errorMessages.length > 0) {
     console.error(
-      `Error executing code for conversation ${conversationId}${
+      `ERROR executing code for conversation ${conversationId}${
         nLoops ? `, attempt ${nLoops}/3` : ""
       }:\n${errorMessages
         // @ts-ignore
@@ -283,23 +322,76 @@ export function checkCodeExecutionOutput(
     );
     return false;
   }
+  // If there are log messages starting with the word Error or ERROR
+  const logMessages = returnedData.filter((m) => m.type === "log");
+  if (
+    logMessages.some(
+      (m) => "message" in m.args && m.args.message.match(/^E(rror|RROR)/),
+    )
+  ) {
+    console.error(
+      `ERROR executing code for conversation ${conversationId}${
+        nLoops ? `, attempt ${nLoops}/3` : ""
+      }:\n${logMessages
+        // @ts-ignore
+        .map((m) => m.args.message)
+        .join("\n")}`,
+    );
+    return false;
+  }
+
   // If 1 plot with missing data
   const plotMessages = returnedData.filter((m) => m.type === "plot");
   if (plotMessages.length === 1) {
     const plotArgs = plotMessages[0].args as BertieGraphData;
+    const isValue = plotArgs.data.length === 1;
+    const isTable = plotArgs.type === "table";
     if (
       // No data (exception is if it's a table or value)
-      (plotArgs.type !== "table" || plotArgs.data.length === 1) &&
+      !isTable &&
+      !isValue &&
+      // Every data point has only 1 key
+      // @ts-ignore
       plotArgs.data.every((d) => Object.keys(d).length <= 1)
     ) {
       console.error(
-        `Missing columns in data output by code for conversation ${conversationId}${
+        `ERROR: Missing columns in data output by code for conversation ${conversationId}${
           nLoops ? `, attempt ${nLoops}/3` : ""
         }:\n${plotMessages
           // @ts-ignore
           .map((m) => m.args.message)
           .join("\n")}`,
       );
+      return false;
+    }
+    const minNonNullsAllowed = isValue || isTable ? 1 : 2;
+    if (
+      // @ts-ignore
+      plotArgs.data.every(
+        // @ts-ignore
+        (d) =>
+          Object.values(d).filter(
+            // @ts-ignore
+            (v) => !["", undefined, null, "undefined", "null"].includes(v),
+          ).length < minNonNullsAllowed,
+      )
+    ) {
+      console.error(
+        `ERROR: Insufficient number of not-null columns in data output by code for conversation ${conversationId}${
+          nLoops ? `, attempt ${nLoops}/3` : ""
+        }:\n${plotMessages
+          // @ts-ignore
+          .map((m) => m.args.message)
+          .join("\n")}`,
+      );
+      return false;
+    }
+    if (
+      isValue &&
+      Object.values(plotArgs.data[0]).filter((v) => typeof v === "number")
+        .length === 0
+    ) {
+      console.error("ERROR: No number in value data: ", plotArgs.data);
       return false;
     }
   }
@@ -362,6 +454,7 @@ export function convertToGraphData(
         );
       });
       if (matchedPlotIdx === -1) return g1;
+      // @ts-ignore
       items[matchedPlotIdx].args.data.push(g1.args.data[0]);
       return undefined;
     })
@@ -427,7 +520,7 @@ export function formatPlotData(
 
 export function ensureXandYinData(
   graphData: BertieGraphData,
-): BertieGraphData["data"] {
+): { [key: string]: any }[] {
   /** If there is no x and y in the data and it's not a table, we want to convert it to having
    *  x and y.
    *
@@ -436,21 +529,38 @@ export function ensureXandYinData(
    *  2. If the labels are not the same as the keys, we go on the order of key-value pairs in
    *  the data and convert the first key to x and the second key to y.
    * **/
+  if (graphData.data.some((item) => Array.isArray(item))) {
+    graphData.data = graphData.data.map((item) => {
+      if (Array.isArray(item) && item.length >= 2) {
+        const newObj: Record<string, string | number> = {
+          x: item[0],
+          y: item[1],
+        };
+        item.slice(2).forEach((val, idx) => {
+          newObj[idx.toString()] = val;
+        });
+        return newObj;
+      }
+      return item;
+    });
+  }
+  // For typing reasons
+  let graphDataOut = graphData.data as { [key: string]: any }[];
   if (
     graphData.type === "table" ||
-    graphData.data.some((item) => "x" in item && "y" in item)
+    graphDataOut.every((item) => "x" in item && "y" in item)
   ) {
-    return graphData.data;
+    return graphDataOut;
   }
 
   // Either x or y is missing from all data points - we want to make a mapping
   const mapping: { x?: string; y?: string } = {}; // E.g. { "x": "date", "y": "value" }
-  const xMissing = graphData.data.every((item) => !("x" in item));
-  const yMissing = graphData.data.every((item) => !("y" in item));
+  const xMissing = graphDataOut.every((item) => !("x" in item));
+  const yMissing = graphDataOut.every((item) => !("y" in item));
 
   // First, check the labels to see if we can work out what x and y should be
   const keys = new Set();
-  graphData.data.forEach((item) => {
+  graphDataOut.forEach((item) => {
     Object.keys(item).forEach((key) => keys.add(key));
   });
   const xLabel = graphData.labels?.x ?? "";
@@ -484,7 +594,7 @@ export function ensureXandYinData(
     let i = 1;
     while (
       (key === "x" ||
-        graphData.data.some((item) => typeof item[key] !== "number")) &&
+        graphDataOut.some((item) => typeof item[key] !== "number")) &&
       i < keys.size
     ) {
       key = Array.from(keys)[i] as string;
@@ -495,10 +605,10 @@ export function ensureXandYinData(
 
   // Use the mapping to update the data
   Object.entries(mapping).forEach(([key, value]) => {
-    graphData.data.forEach((item) => {
+    graphDataOut.forEach((item) => {
       item[key] = item[value];
       delete item[value];
     });
   });
-  return graphData.data;
+  return graphDataOut;
 }

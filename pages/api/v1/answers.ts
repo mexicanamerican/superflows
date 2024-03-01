@@ -308,8 +308,8 @@ export default async function handler(req: NextRequest) {
     // If the language is not set, try to detect it using detectlanguage.com
     if (org.language !== "Detect Language") {
       language = org.language;
-      // } else if (!language && process.env.NEXT_PUBLIC_DETECT_LANGUAGE_KEY) {
-      //   language = await getLanguage(requestData.user_input);
+    } else if (!language && process.env.NEXT_PUBLIC_DETECT_LANGUAGE_KEY) {
+      language = await getLanguage(requestData.user_input);
     }
 
     if (requestData.user_input) {
@@ -339,27 +339,27 @@ export default async function handler(req: NextRequest) {
     // Get the active actions from the DB which we can choose between
     // Below gets the action tags and actions that are active
     let actionsWithTags: ActionTagJoinApiAndHeaders[] | null = null;
-    if (redis) {
-      const redisStored = await redis.get(`action_tags_${org.id}`);
-      if (redisStored) {
-        actionsWithTags = redisStored as ActionTagJoinApiAndHeaders[];
-      }
-    }
-    if (!actionsWithTags) {
-      const actionTagResp = await supabase
-        .from("action_tags")
-        .select("*,actions!inner(*),apis(*, fixed_headers(*))")
-        .eq("org_id", org.id)
-        .eq("actions.active", true);
-      if (actionTagResp.error) throw new Error(actionTagResp.error.message);
-      actionsWithTags = actionTagResp.data;
-      // Set action tags in Redis for 30 minutes
-      redis?.setex(
-        `action_tags_${org.id}`,
-        60 * 30,
-        JSON.stringify(actionsWithTags),
-      );
-    }
+    // if (redis) {
+    //   const redisStored = await redis.get(`action_tags_${org.id}`);
+    //   if (redisStored) {
+    //     actionsWithTags = redisStored as ActionTagJoinApiAndHeaders[];
+    //   }
+    // }
+    // if (!actionsWithTags) {
+    const actionTagResp = await supabase
+      .from("action_tags")
+      .select("*,actions!inner(*),apis(*, fixed_headers(*))")
+      .eq("org_id", org.id)
+      .eq("actions.active", true);
+    if (actionTagResp.error) throw new Error(actionTagResp.error.message);
+    actionsWithTags = actionTagResp.data;
+    // Set action tags in Redis for 30 minutes
+    //   redis?.setex(
+    //     `action_tags_${org.id}`,
+    //     60 * 30,
+    //     JSON.stringify(actionsWithTags),
+    //   );
+    // }
 
     const currentHost = getHost(req);
 
